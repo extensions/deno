@@ -76,6 +76,8 @@ lazy_static::lazy_static! {
       .unwrap();
   static ref MSG_SUGGESTION: Regex =
     Regex::new(r#" Did you mean '([^']+)'\?"#).unwrap();
+  static ref MSG_STATIC_FAILURE_TYPE: Regex =
+    Regex::new(r#"Type 'StaticFailure<(.+?)>' does not satisfy the constraint '"Pass"'."#).unwrap();
 }
 
 /// Potentially convert a "raw" diagnostic message from TSC to something that
@@ -90,8 +92,6 @@ fn format_message(msg: &str, code: &u64) -> String {
           }
         }
       }
-
-      msg.to_string()
     }
     2551 => {
       if let (Some(caps_property), Some(caps_suggestion)) = (
@@ -106,11 +106,93 @@ fn format_message(msg: &str, code: &u64) -> String {
           }
         }
       }
-
-      msg.to_string()
     }
-    _ => msg.to_string(),
+    2344 => {
+      if let Some(captures) = MSG_STATIC_FAILURE_TYPE.captures(msg) {
+        let static_failure_message: Option<String> = (|| {
+          let signature = captures.get(1)?.as_str();
+
+          let source = format!("type T = {};", &signature);
+          let module = crate::ast::parse(
+            "data:",
+            &source,
+            &crate::media_type::MediaType::TypeScript,
+          )
+          .ok()?;
+
+          let message_type = module
+            .module
+            .body
+            .get(0)?
+            .clone()
+            .stmt()?
+            .decl()?
+            .ts_type_alias()?
+            .type_ann;
+
+          let string_message = message_type
+            .clone()
+            .ts_lit_type()
+            .and_then(|l| Some(l.lit.str()?.value.as_ref().to_string()));
+
+          if let Some(ref string_message) = string_message {
+            return Some(string_message.to_string());
+          }
+
+          let tuple_message =
+            message_type.clone().ts_tuple_type().and_then(|t| {
+              Some(
+                t.elem_types
+                  .iter()
+                  .map(|t| {
+                    t.ty
+                      .clone()
+                      .ts_lit_type()
+                      .and_then(|l| {
+                        l.lit.clone().str().map(|str| str.value.to_string())
+                      })
+                      .unwrap_or_else(|| {
+                        let source =
+                          &source[t.span.lo.0 as usize..t.span.hi.0 as usize];
+
+                        // Highlight outer delimiters.
+                        if (source.starts_with("{") && source.ends_with("}"))
+                          || (source.starts_with("[") && source.ends_with("]"))
+                          || (source.starts_with("(") && source.ends_with(")"))
+                        {
+                          return format!(
+                            "{}{}{}",
+                            colors::yellow(&source[..1]).to_string(),
+                            &source[1..source.len() - 1],
+                            colors::yellow(&source[source.len() - 1..])
+                              .to_string()
+                          );
+                        }
+
+                        source.to_string()
+                      })
+                  })
+                  .collect::<Vec<_>>()
+                  .join(""),
+              )
+            });
+
+          if let Some(ref tuple_message) = tuple_message {
+            return Some(tuple_message.to_string());
+          }
+
+          return Some(signature.to_string());
+        })();
+
+        if let Some(message) = static_failure_message {
+          return message;
+        }
+      }
+    }
+    _ => {}
   }
+
+  msg.to_string()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
